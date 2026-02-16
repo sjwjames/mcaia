@@ -5,6 +5,8 @@ import argparse
 import datetime
 import json
 import os
+
+import faiss
 import numpy as np
 import torch
 import time
@@ -68,6 +70,7 @@ parser.add_argument('--n_neighbours', type=int, default=5)
 parser.add_argument('--n_beliefs', type=int, default=10)
 parser.add_argument('--mc_reward_mode', choices=['total', 'time'], default='time')
 parser.add_argument('--post_training', type=int, default=0)
+parser.add_argument('--qlearning', type=int, default=1)
 
 args = parser.parse_args()
 
@@ -238,7 +241,8 @@ def train(seed, save_dir):
                           n_neighbours=args.n_neighbours,
                           n_beliefs=args.n_beliefs,
                           qval_calculation=args.qval_calculation,
-                          reward_mode=args.mc_reward_mode)
+                          reward_mode=args.mc_reward_mode,
+                          qlearning = args.qlearning)
 
     print("Saving model to model.pkl")
     act.save(os.path.join(save_dir_0, "model.pkl"))
@@ -268,8 +272,23 @@ def test():
     #     timelimit_env = timelimit_env.env
 
     # Load the model
-    act = load(os.path.join(args.log_dir, args.log_fname), {"particle_belief": args.particle_belief})
+    if args.qval_calculation == "mc" or args.qval_calculation == "mc-greedy":
+        act = mcknn.load(os.path.join(args.log_dir, args.log_fname), {"particle_belief": args.particle_belief})
+    else:
+        act = load(os.path.join(args.log_dir, args.log_fname), {"particle_belief": args.particle_belief})
 
+    # sval_index = act._agent.model.index
+    # qval_index = act._agent.model.qvalIndex
+    # sval_ivfindex = faiss.IndexIVFFlat(sval_index, sval_index.d, sval_index.ntotal//100)
+    # qval_ivfindex = faiss.IndexIVFFlat(qval_index, qval_index.d, qval_index.ntotal//100)
+    # all_vdata = sval_index.reconstruct_n(0, sval_index.ntotal)
+    # all_qdata = qval_index.reconstruct_n(0, qval_index.ntotal)
+    # sval_ivfindex.train(all_vdata)
+    # sval_ivfindex.add(all_vdata)
+    # qval_ivfindex.train(all_qdata)
+    # qval_ivfindex.add(all_qdata)
+    # faiss.write_index(sval_ivfindex, args.log_dir+"sval_ivfindex.index")
+    # faiss.write_index(qval_ivfindex, args.log_dir+"qval_ivfindex.index")
     # if args.ros_log:
     #     from ttenv.target_tracking.ros_wrapper import RosLog
     #     ros_log = RosLog(num_targets=args.nb_targets, wrapped_num=args.ros + args.render + args.record + 1)
@@ -329,7 +348,7 @@ def test():
                 if args.qval_calculation == "mc" or args.qval_calculation == "mc-greedy":
                     env_info = {"action_map": env.action_map, "observation_func": env.sample_observation,
                                 "agent_model": env.agent,
-                                "target_belief": env.belief_targets}
+                                "target_belief": env.belief_targets,"MAP":env.MAP,"sensor_r":env.sensor_r}
                     knn_state = mcknn.project_belief(obs["agent"].cpu().numpy().squeeze(), obs["target"].cpu().numpy())
                     obs["env_info"] = env_info
                     obs["knn_state"] = knn_state
@@ -337,7 +356,7 @@ def test():
                     if args.qval_calculation == "mc-greedy":
                         greedy_flag = True
                     action, q_vals = act(obs, stochastic=False, update_eps=0.0, greedy_flag=greedy_flag,
-                                         episode_step=episode_step)
+                                         episode_step=episode_step,is_training=False,qlearning=args.qlearning)
                 else:
                     action = act(obs, stochastic=False)
                 next_obs, rew, terminated, truncated, info = env.step(action)

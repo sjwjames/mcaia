@@ -181,7 +181,7 @@ class GMMDist:
         else:
             k = v.shape[0]  # Number of dimensions
             determinant = np.linalg.det(v)
-            ub = 0.5 * (k + k * np.log(2 * np.pi) + np.log(determinant))
+            ub = 0.5 * (k + k * np.log(2 * np.pi) + np.log(determinant+10**-9))
         return ub
 
     def sample(self, n_samples):

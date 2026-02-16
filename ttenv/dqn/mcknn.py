@@ -10,6 +10,7 @@ from sklearn.neighbors import KNeighborsRegressor
 
 from ttenv import util
 from ttenv.base_model import GMMDist
+from ttenv.dqn import ReplayBuffer
 from ttenv.dqn.utils import plot_gaussian_contours, plot_q_values_heatmap
 from ttenv.metadata import METADATA
 import faiss
@@ -30,7 +31,11 @@ def project_belief(agent, targets, masking_agent=False):
         gmm_cov = [np.eye(target_dim) * GMM_APPROX_VAR for _ in range(n)]
         gmm = GMMDist(target[:, 0], target[:, 1:], gmm_cov)
         m, v = gmm.compute_mms()
-        res = np.concatenate((res, m, np.array(v).flatten()), axis=0)
+        ent = gmm.sg_entropy_ub()
+        # res = np.concatenate((res, m, np.array(v).flatten()), axis=0)
+        # res = np.concatenate((res, m, np.array([ent])), axis=0)
+        res = np.concatenate((res, m[:2], np.array([ent])), axis=0)
+        # res = np.concatenate((res, m), axis=0)
     return res
 
 
@@ -55,16 +60,25 @@ def hellinger_distance(m1, v1, m2, v2):
 
 
 class MCKNNModel:
-    def __init__(self, target_dim, agent_dim, T, gamma=0.9, target_type="particle", reward_mode="total", n_neighbors=5,
-                 n_beliefs=10, post_training=False):
+    def __init__(self, target_dim, agent_dim, T, alpha=0.1, target_type="particle", reward_mode="total", n_neighbors=5,
+                 n_beliefs=10, post_training=False, faiss_flag=True, gamma=.95):
         self.target_dim = target_dim
         self.agent_dim = agent_dim
-        # self.gamma = gamma
-        self.index = faiss.IndexFlatL2(agent_dim + target_dim)
+        # knn_dim = agent_dim+(target_dim - 1)+1
+        knn_dim = agent_dim + 2 + 1
+        # knn_dim = agent_dim+(target_dim - 1) + (target_dim - 1) ** 2
+
+        self.alpha = alpha
+        self.index = faiss.IndexFlatL2(knn_dim)  # exclude the weight dim if use projected beliefs
         self.n_beliefs = n_beliefs
         self.T = T
         self.reward_mode = reward_mode
         self.post_training = post_training
+        self.faiss_flag = faiss_flag
+        self.qvals = np.array([])
+        self.values_total = np.array([])
+        self.qvalIndex = faiss.IndexFlatL2(knn_dim)
+        self.gamma = gamma
 
         def distance_metric(data1, data2):
             if target_type == "particle":
@@ -87,14 +101,62 @@ class MCKNNModel:
         self.n_neighbors = n_neighbors
         self.knn_regressor = KNeighborsRegressor(n_neighbors=n_neighbors, weights='distance', algorithm="kd_tree")
 
+    def queryQvals(self, knn_state):
+        np_list = np.array(knn_state)
+        distances, indices = self.qvalIndex.search(np_list, self.n_neighbors)
+        nbr_qvals = self.qvals[indices]
+        weights = (1 /( distances + REG_PARAM)) / np.sum(1 / (distances + REG_PARAM),axis=1,keepdims=True)
+
+        numerator = np.einsum('ijk,ij->ik', nbr_qvals, weights)
+        denominator = weights.sum(axis=1, keepdims=True)
+
+        q_vals = numerator / denominator
+        return q_vals.squeeze()
+
+    def queryStatevals(self, knn_state):
+        distances, indices = self.index.search(x=np.array(knn_state), k=self.n_neighbors)
+        state_vals = []
+        for distance_item, idx_item in zip(distances, indices):
+            normalized_distances = (1 / (np.array(distance_item) + REG_PARAM)) / np.sum(
+                1 / (np.array(distance_item) + REG_PARAM))
+            state_vals.append(np.average(self.values_total[idx_item, 0], axis=0,
+                                         weights=normalized_distances))
+
+        return state_vals
+
+    def addQvals(self, knn_states, q_vals):
+        self.qvalIndex.add(np.array(knn_states))
+        if self.qvals.shape[0] > 0:
+            self.qvals = np.vstack((self.qvals, q_vals))
+        else:
+            self.qvals = np.array(q_vals)
+
+    def addStatevals(self, X, y):
+        self.index.add(np.array(X))
+        if self.values_total.shape[0] > 0:
+            self.values_total = np.vstack((self.values_total, y))
+        else:
+            self.values_total = np.array(y)
+
+
     def __call__(self, belief_states, agent_info, env_info, knn_state, greedy_flag=False, episode_step=None,
-                 save_dir=None, **kwargs):
+                 save_dir=None, is_training=True, qlearning=False, **kwargs):
         print("===== t = " + str(episode_step) + " =====")
+        if qlearning:
+            if not is_training:
+                q_vals = self.queryQvals([knn_state])
+                return q_vals
+            if not greedy_flag:
+                q_vals = self.queryQvals([knn_state])
+                if is_training:
+                    self.addQvals([knn_state],q_vals)
+                return q_vals
         target_beliefs = env_info["target_belief"]
         agent_model = env_info["agent_model"]
         observation_func = env_info["observation_func"]
         action_map = env_info["action_map"]
         q_vals = np.array([0.0 for _ in action_map.values()])
+        q_vals_total = np.array([0.0 for _ in action_map.values()])
         # if save_dir is not None and not greedy_flag:
         #     all_gaussians = [(elem[self.agent_dim:self.agent_dim + 4],
         #                       np.reshape(elem[self.agent_dim + 4:],
@@ -108,7 +170,7 @@ class MCKNNModel:
         selected_neighbor_e = {}
         future_vs = []
         for i, action in enumerate(action_map.values()):
-            next_agent_state,is_col = agent_model.sample_next(action)
+            next_agent_state, is_col = agent_model.sample_next(action)
             sampled_belief_measurements = [[] for _ in range(self.n_beliefs)]
             obstacles_pt = env_info["MAP"].get_closest_obstacle(next_agent_state)
             if obstacles_pt is None:
@@ -138,10 +200,15 @@ class MCKNNModel:
                 #      in
                 #      gmm_next_beliefs])
 
-                r_mean = np.mean(
-                    [predictive_gmm.sg_entropy_ub() - next_b.sg_entropy_ub() for next_b
+                # r_mean = np.mean(
+                #     [predictive_gmm.sg_entropy_ub() - next_b.sg_entropy_ub() for next_b
+                #      in
+                #      gmm_next_beliefs]) - is_col
+
+                r_mean = np.mean([1 / (np.linalg.norm(
+                    np.average(bf[1],weights=bf[0],axis=0)[:2] - np.array(next_agent_state[:2])) + 0.001) for bf
                      in
-                     gmm_next_beliefs]) - is_col
+                     sample_next_beliefs])- is_col
                 # r_mean = np.mean(
                 #     [-next_b.sg_entropy_ub() for next_b in gmm_next_beliefs])
                 # print(r_mean)
@@ -169,10 +236,11 @@ class MCKNNModel:
                             os.makedirs(save_path)
                         plot_gaussian_contours(gaussians, saved_path=save_path + "sampled beliefs.pdf")
                 q_vals[i] = r_mean
+                q_vals_total[i] = r_mean
 
             observed_list = []
             observed_list = np.concatenate((observed_list, obstacles_pt))
-            observed_list = np.concatenate((observed_list, next_agent_state))
+            # observed_list = np.concatenate((observed_list, next_agent_state))
             if not greedy_flag and episode_step + 1 != self.T:
                 next_knn_states = [project_belief(observed_list, np.array(next_b)) for next_b in
                                    sampled_belief_measurements]
@@ -180,21 +248,25 @@ class MCKNNModel:
                 # indices, distances = self.kd_tree.query_radius(states, 1.0, return_distance=True)
                 if self.reward_mode == "total":
                     # shape of distances (n_belief,k)
-                    distances, indices = self.kd_tree_total.query(np.array(next_knn_states), k=self.n_neighbors)
+                    if self.faiss_flag:
+                        distances, indices = self.index.search(x=np.array(next_knn_states), k=self.n_neighbors)
+                    else:
+                        distances, indices = self.kd_tree_total.query(np.array(next_knn_states), k=self.n_neighbors)
                 else:
                     distances, indices = self.kd_trees[episode_step + 1].query(np.array(next_knn_states),
                                                                                k=self.n_neighbors)
                 v_futures = []
                 idx = 0
                 distance_sum = []
+                v_futures_total = []
                 for distance_item, idx_item in zip(distances, indices):
                     distance_sum.append(np.sum(distance_item))
                     normalized_distances = (1 / (np.array(distance_item) + REG_PARAM)) / np.sum(
                         1 / (np.array(distance_item) + REG_PARAM))
                     # distances,indices = self.index.search(states, self.n_neighbors)
                     if self.reward_mode == "total":
-                        # v_futures.append(np.average(self.values_total[idx_item, 0], axis=0,
-                        #                             weights=normalized_distances))
+                        v_futures_total.append(np.average(self.values_total[idx_item, 0], axis=0,
+                                                          weights=normalized_distances))
 
                         # information rate
                         v_futures.append(
@@ -207,9 +279,9 @@ class MCKNNModel:
                             selected_neighbor_t[action].append(self.values_total[idx_item, 1])
 
                         if action not in selected_neighbor_e.keys():
-                            selected_neighbor_e[action] = [idx_item // self.T]
+                            selected_neighbor_e[action] = [self.values_total[idx_item, 1] // self.T]
                         else:
-                            selected_neighbor_e[action].append(idx_item // self.T)
+                            selected_neighbor_e[action].append(self.values_total[idx_item, 1] // self.T)
 
 
                     else:
@@ -242,7 +314,8 @@ class MCKNNModel:
                 #                       weights=normalized_distance_sum)
                 v_future = np.mean(v_futures)
                 future_vs.append(v_future)
-                q_vals[i] += v_future
+                q_vals[i] += self.gamma * v_future
+                q_vals_total[i] += self.gamma * np.mean(v_futures_total)
 
         print("greedy selection: " + str(np.argmax(greedy_r)))
         if not greedy_flag:
@@ -252,17 +325,25 @@ class MCKNNModel:
                 print("selected neighbor at episode:" + str(selected_neighbor_e))
             if len(selected_neighbor_t.values()) > 0:
                 print("selected neighbors:" + str(selected_neighbor_t))
+            # if is_training and not qlearning:
+            #     # todo instead of simply insert the q values to the table, update the existing records as well.
+            #     self.addQvals([knn_state], q_vals_total)
         return q_vals
 
-    def fit(self, X, y):
+    def fit(self, X, y, last_belief_idx):
         # build the index
         print("fitting")
         # self.index.add(np.array(X))  # add vectors to the index
         # self.values = np.concatenate((self.values, y), axis=0)
         # self.knn_regressor.fit(X, y)
+
         if self.reward_mode == "total":
-            self.kd_tree_total = KDTree(X, leaf_size=5)
-            self.values_total = np.array(y)
+            if self.faiss_flag:
+                self.index.add(x=np.array(X[last_belief_idx:]))
+                self.values_total = np.array(y)
+            else:
+                self.kd_tree_total = KDTree(X, leaf_size=5)
+                self.values_total = np.array(y)
 
         else:
             self.kd_trees = [KDTree(x_item, leaf_size=5) for x_item in X]
@@ -270,10 +351,52 @@ class MCKNNModel:
         # assert len(self.values) == len(self.kd_tree.data), "incompatible data size"
         print("finish fitting")
 
+
+    def update_qval(self, x, y, radius, actions,n_brs=1):
+        n = x.shape[0]
+        lims, distances, indices = self.qvalIndex.range_search(x, radius)
+        n_records_updated = 0
+        for i in range(n):
+            action = actions[i]
+            ind = [indices[lims[i]:lims[i + 1]]]
+            dists = [distances[lims[i]:lims[i + 1]]]
+
+            for ind_item, dist_item in zip(ind, dists):
+                if len(ind_item) >= n_brs:
+                    n_records_updated+= len(ind_item)
+                    dist_weights = (1 / (np.array(dist_item) + REG_PARAM)) / np.sum(
+                        (1 / (np.array(dist_item) + REG_PARAM)))
+                    for j, idx in enumerate(ind_item):
+                        self.qvals[idx][action] += self.alpha * dist_weights[j] * (
+                                y[i] - self.qvals[idx][action])
+        return n_records_updated
+
+    def update_state_vals(self, x, y, radius):
+        lims, distances, indices = self.index.range_search(x, radius)
+        n = x.shape[0]
+        for i in range(n):
+            ind = [indices[lims[i]:lims[i + 1]]]
+            dists = [distances[lims[i]:lims[i + 1]]]
+
+            for ind_item, dist_item in zip(ind, dists):
+                if len(ind_item) >= self.n_neighbors:
+                    dist_weights = (1 / (np.array(dist_item) + REG_PARAM)) / np.sum(
+                        (1 / (np.array(dist_item) + REG_PARAM)))
+                    for j, idx in enumerate(ind_item):
+                        self.values_total[idx][0] = self.values_total[idx][0] + self.alpha * dist_weights[j] * (
+                                y[i][0] - self.values_total[idx][0])
+
     def update_val(self, x, y, radius, episode_step):
         # assert len(self.values) == len(self.kd_tree.data), "incompatible data size"
         if self.reward_mode == "total":
-            ind, dists = self.kd_tree_total.query_radius([x], radius, return_distance=True)
+            if self.faiss_flag:
+
+                lims, distances, indices = self.index.range_search(np.array([x]), radius)
+                ind = [indices[lims[0]:lims[1]]]
+                dists = [distances[lims[0]:lims[1]]]
+
+            else:
+                ind, dists = self.kd_tree_total.query_radius([x], radius, return_distance=True)
         else:
             ind, dists = self.kd_trees[episode_step].query_radius([x], radius, return_distance=True)
         for ind_item, dist_item in zip(ind, dists):
@@ -286,11 +409,12 @@ class MCKNNModel:
                         # self.values_total[idx] = self.values_total[idx] + dist_weights[i] * (
                         #         y - self.values_total[idx])
 
-                        self.values_total[idx][0] = self.values_total[idx][0] + dist_weights[i] * (
+                        self.values_total[idx][0] = self.values_total[idx][0] + self.alpha * dist_weights[i] * (
                                 y[0] - self.values_total[idx][0])
                     else:
-                        self.values[episode_step][idx] = self.values[episode_step][idx] + dist_weights[i] * (
-                                y - self.values[episode_step][idx])
+                        self.values[episode_step][idx] = self.values[episode_step][idx] + self.alpha * dist_weights[
+                            i] * (
+                                                                 y - self.values[episode_step][idx])
 
 
 class MCKNNAgent:
@@ -427,7 +551,7 @@ def learn(env,
           checkpoint_freq=10000,
           checkpoint_path=None,
           learning_starts=-1,
-          gamma=0.9,
+          gamma=0.95,
           target_network_update_freq=100,
           param_noise=False,
           callback=None,
@@ -447,7 +571,8 @@ def learn(env,
           n_neighbours=5,
           n_beliefs=10,
           reward_mode="total",
-          qval_calculation="mc"):
+          qval_calculation="mc",
+          qlearning=True):
     observation_shape = env.observation_space.shape
     # device = torch.device(
     #     device
@@ -481,15 +606,16 @@ def learn(env,
 
     # Initialization variables
     obs = env.reset()
-    model = MCKNNModel(len(env.targets[0].state), len(env.agent.state), epoch_steps, gamma=gamma,
+    agent_dim, target_dim = obs["agent"].cpu().numpy().shape[-1], obs["target"].cpu().numpy().shape[-1]
+    model = MCKNNModel(target_dim, agent_dim, epoch_steps,
                        reward_mode=reward_mode,
                        n_neighbors=n_neighbours,
-                       n_beliefs=n_beliefs)
+                       n_beliefs=n_beliefs, gamma=gamma, alpha=lr)
     mcknn_agent = MCKNNAgent(model, env.action_space.n)
     act = ActWrapper(mcknn_agent, act_params)
 
     env_info = {"action_map": env.action_map, "observation_func": env.sample_observation, "agent_model": env.agent,
-                "target_belief": env.belief_targets,"MAP":env.MAP,"sensor_r":env.sensor_r}
+                "target_belief": env.belief_targets, "MAP": env.MAP, "sensor_r": env.sensor_r}
 
     episode_reward = 0
     episode_step = 0
@@ -502,17 +628,22 @@ def learn(env,
     lin_dist_range_a2b = METADATA["lin_dist_range_a2b"]
     lin_dist_range_b2t = METADATA["lin_dist_range_b2t"]
     ang_dist_range_a2b = METADATA["ang_dist_range_a2b"]
-    if reward_mode == "total":
-        belief_states = []
-        state_values = []
-    else:
-        belief_states = [[] for _ in range(epoch_steps)]
-        state_values = [[] for _ in range(epoch_steps)]
+    # if reward_mode == "total":
+    #     belief_states = []
+    #     state_values = []
+    # else:
+    #     belief_states = [[] for _ in range(epoch_steps)]
+    #     state_values = [[] for _ in range(epoch_steps)]
     step_vals = []
     step_beliefs = []
     step_qvals = []
+    step_actions = []
+    step_acc_vals = []
+    cur_acc_val = 0
+    replay_buffer = ReplayBuffer(buffer_size,device=device)
     if qval_calculation == "mc":
         # Main training loop
+        last_belief_idx = 0
         for t in range(max_timesteps):
             # Select action
             # knn_state = np.concatenate((
@@ -533,15 +664,17 @@ def learn(env,
                 action, q_vals = act(obs, stochastic=True,
                                      update_eps=exploration[min(t, len(exploration) - 1)],
                                      greedy_flag=(t < learning_starts or qval_calculation == "mc-greedy"),
-                                     episode_step=episode_step)
+                                     episode_step=episode_step,qlearning=qlearning)
             if q_vals is not None:
                 step_qvals.append(q_vals)
+            step_actions.append(action)
             # Execute action and observe next state
             next_obs, reward, terminated, truncated, info = env.step(action)
             # training_dir = os.path.join(save_dir, str(num_episodes) + "_training/")
             # if not os.path.exists(training_dir):
             #     os.makedirs(training_dir)
             # env.render(log_dir=training_dir)
+
             done = terminated or truncated
 
             # if t >= learning_starts:
@@ -556,13 +689,24 @@ def learn(env,
             #     step_vals.append(v_val)
 
             step_vals.append(reward)
-
+            cur_acc_val += reward
+            step_acc_vals.append(cur_acc_val)
             # Update statistics
             episode_reward += reward
             episode_step += 1
 
             # Update observation
             obs = next_obs
+
+            if qval_calculation == "mc" and qlearning:
+                next_knn_state = project_belief(next_obs["agent"].cpu().numpy().squeeze(),
+                                                next_obs["target"].cpu().numpy())
+
+                if t >= learning_starts:
+                    next_state_vals = model.queryQvals([next_knn_state])
+                    y = max(next_state_vals) * gamma + reward
+                    model.update_qval(np.array([knn_state]),[y], radius, [action])
+                replay_buffer.add(knn_state,action,reward,next_knn_state,done)
 
             # End of episode
             if done:
@@ -572,7 +716,7 @@ def learn(env,
                 episode_rewards_history.append(episode_reward)
                 episode_discovery_rate_dist.append([dr / epoch_steps for dr in env.discover_cnt])
                 # if num_episodes % (checkpoint_freq // epoch_steps) == 0:
-                if num_episodes % eval_check == 0:
+                if num_episodes % eval_check == 0 and num_episodes!=0:
                     rollout_dir = os.path.join(save_dir, str(num_episodes) + "_eval_rollout/")
                     if not os.path.exists(rollout_dir):
                         os.makedirs(rollout_dir)
@@ -589,10 +733,9 @@ def learn(env,
                                                        obs["target"].cpu().numpy())
                             obs["env_info"] = env_info
                             obs["knn_state"] = knn_state
-                            action, q_vals = act(obs, stochastic=True,
-                                                 update_eps=exploration[min(t, len(exploration) - 1)],
-                                                 greedy_flag=(t < learning_starts or qval_calculation == "mc-greedy"),
-                                                 episode_step=t_eval)
+                            action, q_vals = act(obs, stochastic=False,
+                                                 greedy_flag=(qval_calculation == "mc-greedy"),
+                                                 episode_step=t_eval, is_training=False,qlearning=qlearning)
                             # Execute action and observe next state
                             next_obs, reward, terminated, truncated, info = env.step(action)
                             eval_episode_reward += reward
@@ -602,55 +745,64 @@ def learn(env,
                         eval_episode_rewards.append(eval_episode_reward)
                     eval_returns[1].append(np.mean(eval_episode_rewards))
                     eval_returns[2].append(np.std(eval_episode_rewards))
-                # temp code, for training
-                # if num_episodes % 100 == 0 and np.mean(episode_discovery_rate_dist[-100:]) > .8:
-                #     if reuse_last_init:
-                #         env.init_pose["targets"][0][0] = np.clip(env.init_pose["targets"][0][0] + 1, env.MAP.mapmin[0],
-                #                                                  env.MAP.mapmax[0] - 1.0)
-                #         env.init_pose["targets"][0][1] = np.clip(env.init_pose["targets"][0][1] + 1, env.MAP.mapmin[1],
-                #                                                  env.MAP.mapmax[1] - 1.0)
-                #     add_times += 1
-                #     lin_dist_range_a2b = (lin_dist_range_a2b[0], min(20.0, lin_dist_range_a2b[1] + add_times * 1.0))
-                #     lin_dist_range_b2t = (lin_dist_range_b2t[0], min(20.0, lin_dist_range_b2t[1] + add_times * 1.0))
-                #     ang_dist_range_a2b = (
-                #         max(-np.pi, ang_dist_range_a2b[0] - add_times * .1),
-                #         min(np.pi, ang_dist_range_a2b[1] + add_times * .1))
-                #     speed = min(env.target_speed_limit + 1.0, 3.0)
-                #     env.set_limits(target_speed_limit=speed)
-                #     env.init_pose["targets"][0][2] = speed
-                #     env.targets[0].limit = env.limit['target']
+
                 num_episodes += 1
 
                 if qval_calculation == "mc":
-                    # if t > learning_starts:
-                    #     model.fit(belief_states, state_values)
-                    # else:
-                    #     for i, bs in enumerate(step_beliefs):
-                    #         if reward_mode == "total":
-                    #             belief_states.append(bs)
-                    #             state_values.append(np.sum(step_vals[i:]))
-                    #         else:
-                    #             belief_states[i].append(bs)
-                    #             state_values[i].append(np.sum(step_vals[i:]))
-                    #     if t == learning_starts - 1:
-                    #         model.fit(belief_states, state_values)
-                    current_val = np.sum(step_vals)
-                    for i, bs in enumerate(step_beliefs):
-                        if reward_mode == "total":
-                            belief_states.append(bs)
-                            v = current_val
-                            v = (v, i)
+                    if qlearning:
+                        current_episode_qVals = np.zeros([len(step_vals),env.action_space.n])
+                        for i in range(len(step_vals)-1,-1,-1):
+                            if i==len(step_vals)-1:
+                                current_episode_qVals[i][step_actions[i]]=step_vals[i]
 
-                            state_values.append(v)
-                            if t >= learning_starts:
-                                model.update_val(bs, v, radius, i)
+                            else:
+                                current_episode_qVals[i][step_actions[i]] = step_vals[i]+ gamma*current_episode_qVals[i+1][step_actions[i+1]]
 
-                        else:
-                            belief_states[i].append(bs)
-                            state_values[i].append(current_val)
-                        current_val -= step_vals[i]
-                    if t >= learning_starts - 1:
-                        model.fit(belief_states, state_values)
+
+                        model.addQvals(step_beliefs,current_episode_qVals)
+                        if len(replay_buffer) > batch_size:
+                            batch = replay_buffer.sample(batch_size)
+                            knn_states_t, actions, rewards, knn_states_t1, dones = batch
+
+                            q_t1 = model.queryQvals(knn_states_t1.detach().cpu().numpy())
+                            ys = rewards + q_t1.max(axis=1) * gamma
+                            n_updated = model.update_qval(knn_states_t.detach().cpu().numpy(), ys, radius, actions)
+                            print(str(n_updated) + " records updated")
+
+                    else:
+
+                        current_episode_stateVals = [[0.0,i] for i,item in enumerate(step_vals)]
+                        for i in range(len(step_vals)-1,-1,-1):
+                            if i == len(step_vals) - 1:
+                                current_episode_stateVals[i][0] = step_vals[i]
+
+                            else:
+                                current_episode_stateVals[i][0] = step_vals[i] + gamma*current_episode_stateVals[i+1][0]
+
+                        model.addStatevals(step_beliefs, current_episode_stateVals)
+                        if t >= learning_starts:
+                            model.update_state_vals(np.array(step_beliefs), current_episode_stateVals, radius)
+
+                        # current_val = np.sum(step_vals)
+                        # for i, bs in enumerate(step_beliefs):
+                        #     if reward_mode == "total":
+                        #         belief_states.append(bs)
+                        #         v = current_val
+                        #         v = (v, i)
+                        #
+                        #         state_values.append(v)
+                        #         if t >= learning_starts:
+                        #             model.update_val(bs, v, radius, i)
+                        #
+                        #     else:
+                        #         belief_states[i].append(bs)
+                        #         state_values[i].append(current_val)
+                        #     current_val -= step_vals[i]
+                        #
+                        # if t>=learning_starts:
+                        #     model.fit(belief_states, state_values, last_belief_idx)
+                        #     last_belief_idx = len(belief_states)
+
                 # if len(step_qvals) > 0:
                 #     plot_q_values_heatmap(step_qvals, training_dir + "q values.pdf",
                 #                           action_labels=np.round(list(env.action_map.values()), 2))
@@ -664,6 +816,9 @@ def learn(env,
                 step_vals = []
                 step_beliefs = []
                 step_qvals = []
+                step_actions = []
+                step_acc_vals = []
+                cur_acc_val = 0
 
             # Evaluate and save model
             if t > learning_starts and checkpoint_freq is not None and t % checkpoint_freq == 0:
@@ -695,5 +850,17 @@ def learn(env,
         ax.set_ylabel("Return")
         plt.savefig(os.path.join(save_dir, "eval_returns.png"))
         plt.close(fig)
-
+        if model.faiss_flag:
+            faiss.write_index(model.index, save_dir + "statevalue.index")
+            faiss.write_index(model.qvalIndex, save_dir + "qvalue.index")
+            sval_ivfindex = faiss.IndexIVFFlat(model.index, model.index.d, model.index.ntotal)
+            qval_ivfindex = faiss.IndexIVFFlat(model.qvalIndex, model.qvalIndex.d, model.qvalIndex.ntotal)
+            all_vdata = model.index.reconstruct_n(0, model.index.ntotal)
+            all_qdata = model.qvalIndex.reconstruct_n(0, model.qvalIndex.ntotal)
+            sval_ivfindex.train(all_vdata)
+            sval_ivfindex.add(all_vdata)
+            qval_ivfindex.train(all_qdata)
+            qval_ivfindex.add(all_qdata)
+            faiss.write_index(sval_ivfindex, save_dir + "sval_ivfindex.index")
+            faiss.write_index(qval_ivfindex, save_dir + "qval_ivfindex.index")
     return act
