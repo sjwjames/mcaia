@@ -71,6 +71,8 @@ parser.add_argument('--n_beliefs', type=int, default=10)
 parser.add_argument('--mc_reward_mode', choices=['total', 'time'], default='time')
 parser.add_argument('--post_training', type=int, default=0)
 parser.add_argument('--qlearning', type=int, default=1)
+parser.add_argument('--continue_learning', type=int, default=0)
+parser.add_argument('--base_model', type=str, default="")
 
 args = parser.parse_args()
 
@@ -242,7 +244,9 @@ def train(seed, save_dir):
                           n_beliefs=args.n_beliefs,
                           qval_calculation=args.qval_calculation,
                           reward_mode=args.mc_reward_mode,
-                          qlearning = args.qlearning)
+                          qlearning = args.qlearning,
+                          continue_learning=args.continue_learning,
+                          base_model=args.base_model)
 
     print("Saving model to model.pkl")
     act.save(os.path.join(save_dir_0, "model.pkl"))
@@ -277,6 +281,8 @@ def test():
     else:
         act = load(os.path.join(args.log_dir, args.log_fname), {"particle_belief": args.particle_belief})
 
+    ob_info_flag = env.MAP.map is not None
+    # ob_info_flag= False
     # sval_index = act._agent.model.index
     # qval_index = act._agent.model.qvalIndex
     # sval_ivfindex = faiss.IndexIVFFlat(sval_index, sval_index.d, sval_index.ntotal//100)
@@ -296,6 +302,7 @@ def test():
     # Use a fixed set of initial positions if given
 
     seed = args.seed
+
     for _ in range(args.repeat):
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -316,6 +323,7 @@ def test():
         episode_agent_target_dist = []
         if METADATA["observation_model"] == LEAKAGE_OBS:
             particle_obs = []
+
         while (ep < args.nb_test_steps):  # test episode
             ep += 1
             episode_rew, nlogdetcov = 0, 0
@@ -349,7 +357,7 @@ def test():
                     env_info = {"action_map": env.action_map, "observation_func": env.sample_observation,
                                 "agent_model": env.agent,
                                 "target_belief": env.belief_targets,"MAP":env.MAP,"sensor_r":env.sensor_r}
-                    knn_state = mcknn.project_belief(obs["agent"].cpu().numpy().squeeze(), obs["target"].cpu().numpy())
+                    knn_state = mcknn.project_belief(obs["agent"].cpu().numpy().squeeze(), obs["target"].cpu().numpy(),not ob_info_flag)
                     obs["env_info"] = env_info
                     obs["knn_state"] = knn_state
                     greedy_flag = False
@@ -367,7 +375,7 @@ def test():
             episode_discovery_rate_dist.append(np.mean([dr / args.nb_epoch_steps for dr in env.discover_cnt]))
             episode_agent_target_dist.append(np.mean(env.agent_target_dist, axis=0))
             if METADATA["observation_model"] == LEAKAGE_OBS:
-                particle_obs.append(env.particles_observed)
+                particle_obs.append(np.squeeze(env.observation_hist))
             time_elapsed.append(time.time() - s_time)
             ep_nlogdetcov.append(nlogdetcov)
             print(f"Ep.{ep} - Episode reward: {episode_rew:.2f}, Episode nLogDetCov: {nlogdetcov:.2f}")
@@ -398,7 +406,7 @@ def test():
 
 if __name__ == '__main__':
     if args.mode == 'train':
-        save_dir = os.path.join(args.log_dir, '_'.join([args.env, datetime.datetime.now().strftime("%m%d%H%M")]))
+        save_dir = os.path.join(args.log_dir, '_'.join([args.env, datetime.datetime.now().strftime("%m%d%H%M%S")]))
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         else:

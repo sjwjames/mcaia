@@ -69,8 +69,8 @@ METADATA_v1 was used for the experiments presented. To note, some variables need
 q-network --nb_warmup_steps 10000 --act_policy bayesian --blocked 1
 * DQN: --device "mps" --mode "train" --env "TargetTracking-v1" --map obstacles --particle_belief 0 --num_particles 100 --nb_train_steps 20000 --reuse_last_init 1 --nb_epoch_steps 100 --target_update_freq 50 --checkpoint_freq 1000 --qval_calculation
 q-network --nb_warmup_steps 10000 --act_policy egreedy --blocked 1
-* MCAIA: --device "mps" --mode "train" --env "TargetTracking-v1_1" --map obstacles --particle_belief 1 --num_particles 100 --nb_train_steps 20000 --reuse_last_init 1 --nb_epoch_steps 100 --target_update_freq 50 --checkpoint_freq 1000 --qval_calculation
-mc --nb_warmup_steps 10000 --act_policy egreedy --blocked 1 --n_neighbours 10 --n_beliefs 10 --mc_reward_mode total
+* QAIA: --device "mps" --mode "train" --env "TargetTracking-v1_1" --map obstacles --particle_belief 1 --num_particles 100 --nb_train_steps 20000 --reuse_last_init 1 --nb_epoch_steps 100 --target_update_freq 50 --checkpoint_freq 1000 --qval_calculation
+mc --nb_warmup_steps 10000 --act_policy egreedy --blocked 1 --n_neighbours 10 --n_beliefs 10 --mc_reward_mode total --q_learning 1
 * Infotaxis: --device "mps" --mode "train" --env "TargetTracking-v1_1" --map obstacles --particle_belief 1 --num_particles 100 --nb_train_steps 20000 --reuse_last_init 1 --nb_epoch_steps 100 --target_update_freq 50 --checkpoint_freq 1000 --qval_calculation
 mc-greedy --nb_warmup_steps 10000 --act_policy egreedy --blocked 1 --n_neighbours 10 --n_beliefs 10 --mc_reward_mode total
 * To train with random initial pose, set --reuse_last_init 0
@@ -81,8 +81,8 @@ mc-greedy --nb_warmup_steps 10000 --act_policy egreedy --blocked 1 --n_neighbour
 q-network --reuse_last_init 1 --log_dir ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/ --init_file_path ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/init_pose.pkl --act_policy bayesian --blocked 1
 * DQN: --device "mps" --mode "test" --log_fname model.pkl --map obstacles --repeat 5 --env "TargetTracking-v1" --particle_belief 0 --qval_calculation
 q-network --reuse_last_init 1 --log_dir ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/ --init_file_path ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/init_pose.pkl --act_policy egreedy --blocked 1
-* MCAIA: --device "mps" --mode "test" --log_fname model.pkl --map obstacles --repeat 5 --env "TargetTracking-v1_1" --particle_belief 1 --qval_calculation
-mc --reuse_last_init 1 --log_dir ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/ --init_file_path ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/init_pose.pkl --act_policy egreedy --blocked 1 --n_neighbours 10 --n_beliefs 10 --mc_reward_mode total
+* QAIA: --device "mps" --mode "test" --log_fname model.pkl --map obstacles --repeat 5 --env "TargetTracking-v1_1" --particle_belief 1 --qval_calculation
+mc --reuse_last_init 1 --log_dir ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/ --init_file_path ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/init_pose.pkl --act_policy egreedy --blocked 1 --n_neighbours 10 --n_beliefs 10 --mc_reward_mode total --q_learning 1
 * Infotaxis: --device "mps" --mode "test" --log_fname model.pkl --map obstacles --repeat 5 --env "TargetTracking-v1_1" --particle_belief 1 --qval_calculation
 mc-greedy --reuse_last_init 1 --log_dir ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/ --init_file_path ./experiments/final_results/non-markovian/TargetTracking-v1_07152337/seed_0/init_pose.pkl --act_policy egreedy --blocked 1 --n_neighbours 10 --n_beliefs 10 --mc_reward_mode total
 * To test with random initial pose, set --reuse_last_init 0

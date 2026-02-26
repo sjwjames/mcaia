@@ -549,7 +549,6 @@ class GasLeakageModel:
         self.rate_threshold = 50
         self.klist = []
         self.pmf_list = []
-
     def get_emission_rate(self, agent, target):
         lam = np.sqrt(self.D * self.tau / (1 + self.V ** 2 * self.tau / (4 * self.D)))
         # r = self.Q0 / np.log(lam / self.a) * np.exp((agent_coord[0] - target_coord[0]) * self.V / (2 * self.D)) * i0(

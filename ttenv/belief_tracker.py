@@ -14,7 +14,7 @@ from filterpy.kalman import JulierSigmaPoints, UnscentedKalmanFilter, ExtendedKa
 
 from ttenv.base_model import ParticleDist, LinearGaussianDistribution, GMMDist, batch_mvnorm_logpdf, \
     batch_mvnorm_logpdf_multi_cov, GasLeakageModel
-from ttenv.metadata import METADATA, GAUSSIAN_OBS, LEAKAGE_OBS
+from ttenv.metadata import METADATA, GAUSSIAN_OBS, LEAKAGE_OBS, GMM_APPROX_VAR
 
 REG_PARAM = 1e-9
 
@@ -389,7 +389,7 @@ class PFbelief(object):
 
     def entropy(self):
         state_dim = len(self.states[0])
-        gmm_approx = GMMDist(self.weights, self.states, [np.eye(state_dim) * 0.01 for _ in self.weights])
+        gmm_approx = GMMDist(self.weights, self.states, [np.eye(state_dim) * GMM_APPROX_VAR for _ in self.weights])
         ent = gmm_approx.sg_entropy_ub()
         return ent
         # m, c = self.calculate_bs_moments()

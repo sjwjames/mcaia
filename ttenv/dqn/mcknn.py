@@ -12,12 +12,12 @@ from ttenv import util
 from ttenv.base_model import GMMDist
 from ttenv.dqn import ReplayBuffer
 from ttenv.dqn.utils import plot_gaussian_contours, plot_q_values_heatmap
-from ttenv.metadata import METADATA
+from ttenv.metadata import METADATA, GMM_APPROX_VAR
 import faiss
 from sklearn.neighbors import KDTree
 
 REG_PARAM = 1e-9
-GMM_APPROX_VAR = 1e-3
+
 
 
 def project_belief(agent, targets, masking_agent=False):
@@ -61,13 +61,16 @@ def hellinger_distance(m1, v1, m2, v2):
 
 class MCKNNModel:
     def __init__(self, target_dim, agent_dim, T, alpha=0.1, target_type="particle", reward_mode="total", n_neighbors=5,
-                 n_beliefs=10, post_training=False, faiss_flag=True, gamma=.95):
+                 n_beliefs=10, post_training=False, faiss_flag=True, gamma=.95,ob_info_flag=False):
         self.target_dim = target_dim
         self.agent_dim = agent_dim
-        # knn_dim = agent_dim+(target_dim - 1)+1
-        knn_dim = agent_dim + 2 + 1
-        # knn_dim = agent_dim+(target_dim - 1) + (target_dim - 1) ** 2
-
+        self.ob_info_flag = ob_info_flag
+        if self.ob_info_flag:
+            # knn_dim = agent_dim+(target_dim - 1)+1
+            knn_dim = agent_dim + 2 + 1
+            # knn_dim = agent_dim+(target_dim - 1) + (target_dim - 1) ** 2
+        else:
+            knn_dim = 3
         self.alpha = alpha
         self.index = faiss.IndexFlatL2(knn_dim)  # exclude the weight dim if use projected beliefs
         self.n_beliefs = n_beliefs
@@ -79,6 +82,7 @@ class MCKNNModel:
         self.values_total = np.array([])
         self.qvalIndex = faiss.IndexFlatL2(knn_dim)
         self.gamma = gamma
+
 
         def distance_metric(data1, data2):
             if target_type == "particle":
@@ -169,6 +173,7 @@ class MCKNNModel:
         selected_neighbor_t = {}
         selected_neighbor_e = {}
         future_vs = []
+        c_penalty = 0.0 if not self.ob_info_flag else 10.0
         for i, action in enumerate(action_map.values()):
             next_agent_state, is_col = agent_model.sample_next(action)
             sampled_belief_measurements = [[] for _ in range(self.n_beliefs)]
@@ -198,19 +203,24 @@ class MCKNNModel:
                 # r_mean = np.mean(
                 #     [predictive_gmm.sg_entropy_ub() - next_b.sg_entropy_ub() for next_b
                 #      in
-                #      gmm_next_beliefs])
+                #      gmm_next_beliefs])- is_col*c_penalty
 
-                # r_mean = np.mean(
-                #     [predictive_gmm.sg_entropy_ub() - next_b.sg_entropy_ub() for next_b
-                #      in
-                #      gmm_next_beliefs]) - is_col
 
-                r_mean = np.mean([1 / (np.linalg.norm(
-                    np.average(bf[1],weights=bf[0],axis=0)[:2] - np.array(next_agent_state[:2])) + 0.001) for bf
+                # r_mean = np.mean(sampled_ys) - is_col * c_penalty
+
+                r_mean = np.mean([(predictive_gmm.sg_entropy_ub() - bf.sg_entropy_ub()) / (np.linalg.norm(
+                    np.average(bf.means,weights=bf.weights,axis=0)[:2] - np.array(next_agent_state[:2])) + 0.001) for bf
                      in
-                     sample_next_beliefs])- is_col
-                # r_mean = np.mean(
-                #     [-next_b.sg_entropy_ub() for next_b in gmm_next_beliefs])
+                     gmm_next_beliefs])
+                if self.ob_info_flag:
+                    if is_col:
+                        r_mean = -c_penalty
+
+                # r_mean = np.mean([1.0 / (np.linalg.norm(
+                #     np.average(bf.means, weights=bf.weights, axis=0)[:2] - np.array(next_agent_state[:2])) + 0.001) for
+                #                   bf
+                #                   in
+                #                   gmm_next_beliefs]) - is_col * c_penalty
                 # print(r_mean)
                 greedy_r.append(r_mean)
                 if not greedy_flag and episode_step + 1 != self.T:
@@ -242,7 +252,7 @@ class MCKNNModel:
             observed_list = np.concatenate((observed_list, obstacles_pt))
             # observed_list = np.concatenate((observed_list, next_agent_state))
             if not greedy_flag and episode_step + 1 != self.T:
-                next_knn_states = [project_belief(observed_list, np.array(next_b)) for next_b in
+                next_knn_states = [project_belief(observed_list, np.array(next_b),not self.ob_info_flag) for next_b in
                                    sampled_belief_measurements]
 
                 # indices, distances = self.kd_tree.query_radius(states, 1.0, return_distance=True)
@@ -316,7 +326,7 @@ class MCKNNModel:
                 future_vs.append(v_future)
                 q_vals[i] += self.gamma * v_future
                 q_vals_total[i] += self.gamma * np.mean(v_futures_total)
-
+        # print(greedy_r)
         print("greedy selection: " + str(np.argmax(greedy_r)))
         if not greedy_flag:
             print("non-myopic selection: " + str(np.argmax(q_vals)))
@@ -572,7 +582,9 @@ def learn(env,
           n_beliefs=10,
           reward_mode="total",
           qval_calculation="mc",
-          qlearning=True):
+          qlearning=True,
+          continue_learning=False,
+          base_model = ""):
     observation_shape = env.observation_space.shape
     # device = torch.device(
     #     device
@@ -589,8 +601,8 @@ def learn(env,
     exploration_final_eps = 0.0
     if qval_calculation == "mc":
         # exploration = np.ones(max_timesteps)
-        # exploration[learning_starts + 1:] = np.linspace(1.0, exploration_final_eps,
-        #                                                 max_timesteps - (learning_starts + 1))
+        # exploration = np.linspace(1.0, exploration_final_eps,
+        #                                                 max_timesteps)
         exploration = np.ones(max_timesteps) * exploration_final_eps
     else:
         exploration = np.ones(max_timesteps) * exploration_final_eps
@@ -607,12 +619,20 @@ def learn(env,
     # Initialization variables
     obs = env.reset()
     agent_dim, target_dim = obs["agent"].cpu().numpy().shape[-1], obs["target"].cpu().numpy().shape[-1]
-    model = MCKNNModel(target_dim, agent_dim, epoch_steps,
-                       reward_mode=reward_mode,
-                       n_neighbors=n_neighbours,
-                       n_beliefs=n_beliefs, gamma=gamma, alpha=lr)
-    mcknn_agent = MCKNNAgent(model, env.action_space.n)
-    act = ActWrapper(mcknn_agent, act_params)
+    ob_info_flag = env.MAP.map is not None
+    # ob_info_flag = False
+    if continue_learning:
+        act = load(base_model, {"particle_belief": particle_belief})
+        mcknn_agent = act._agent
+        model = mcknn_agent.model
+        learning_starts = 0
+    else:
+        model = MCKNNModel(target_dim, agent_dim, epoch_steps,
+                           reward_mode=reward_mode,
+                           n_neighbors=n_neighbours,
+                           n_beliefs=n_beliefs, gamma=gamma, alpha=lr,ob_info_flag=ob_info_flag)
+        mcknn_agent = MCKNNAgent(model, env.action_space.n)
+        act = ActWrapper(mcknn_agent, act_params)
 
     env_info = {"action_map": env.action_map, "observation_func": env.sample_observation, "agent_model": env.agent,
                 "target_belief": env.belief_targets, "MAP": env.MAP, "sensor_r": env.sensor_r}
@@ -641,6 +661,7 @@ def learn(env,
     step_acc_vals = []
     cur_acc_val = 0
     replay_buffer = ReplayBuffer(buffer_size,device=device)
+
     if qval_calculation == "mc":
         # Main training loop
         last_belief_idx = 0
@@ -649,7 +670,7 @@ def learn(env,
             # knn_state = np.concatenate((
             #     obs["agent"].cpu().numpy().flatten(), obs["target"].cpu().numpy().flatten()),
             #     axis=0)
-            knn_state = project_belief(obs["agent"].cpu().numpy().squeeze(), obs["target"].cpu().numpy())
+            knn_state = project_belief(obs["agent"].cpu().numpy().squeeze(), obs["target"].cpu().numpy(),not ob_info_flag)
             step_beliefs.append(knn_state)
             obs["env_info"] = env_info
             obs["knn_state"] = knn_state
@@ -700,7 +721,7 @@ def learn(env,
 
             if qval_calculation == "mc" and qlearning:
                 next_knn_state = project_belief(next_obs["agent"].cpu().numpy().squeeze(),
-                                                next_obs["target"].cpu().numpy())
+                                                next_obs["target"].cpu().numpy(),not ob_info_flag)
 
                 if t >= learning_starts:
                     next_state_vals = model.queryQvals([next_knn_state])
@@ -730,7 +751,7 @@ def learn(env,
                                         blocked=blocked)
                         for t_eval in range(int(eval_steps)):
                             knn_state = project_belief(obs["agent"].cpu().numpy().squeeze(),
-                                                       obs["target"].cpu().numpy())
+                                                       obs["target"].cpu().numpy(),not ob_info_flag)
                             obs["env_info"] = env_info
                             obs["knn_state"] = knn_state
                             action, q_vals = act(obs, stochastic=False,

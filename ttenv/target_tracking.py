@@ -57,7 +57,7 @@ from ttenv.maps import map_utils
 from ttenv.agent_models import *
 from ttenv.policies import *
 from ttenv.belief_tracker import KFbelief, UKFbelief, PFbelief, AuxiliaryPFbelief
-from ttenv.metadata import METADATA, DEVICE, LEAKAGE_OBS
+from ttenv.metadata import METADATA, DEVICE, LEAKAGE_OBS, GMM_APPROX_VAR
 import ttenv.util as util
 from ttenv.base import TargetTrackingBase
 
@@ -391,7 +391,7 @@ class TargetTrackingEnv1(TargetTrackingBase):
         self.discover_cnt = [0 for _ in range(self.num_targets)]
         self.agent_target_dist = [[] for _ in range(self.num_targets)]
         self.max_ent = np.log(np.prod(np.array(self.limit["target"][1]) - np.array(self.limit["target"][0])))
-
+        self.observation_hist = []
         for i in range(self.num_targets):
             self.belief_targets[i].reset(
                 init_state=np.concatenate((init_pose['belief_targets'][i][:2], np.zeros(2))),
@@ -444,14 +444,17 @@ class TargetTrackingEnv1(TargetTrackingBase):
 
     def observe_and_update_belief(self):
         observed = []
+        observation_vals = []
         for i in range(self.num_targets):
             observation = self.observation(self.targets[i])
             observed.append(observation[0])
+            observation_vals.append(observation[1])
             if observation[0]:  # if observed, update the target belief.
                 self.belief_targets[i].update(observation[1], self.agent.state)
                 self.discover_cnt[i] += 1
                 if not (self.has_discovered[i]):
                     self.has_discovered[i] = 1
+        self.observation_hist.append(observation_vals)
         return observed
 
     def state_func(self, action_vw, observed):
@@ -566,16 +569,26 @@ class TargetTrackingEnv1(TargetTrackingBase):
                                    for _ in range(self.num_targets)]
 
     def get_reward(self, is_training=True, **kwargs):
+        reward = np.sum([(self.last_ents[i] - bf.entropy()) / (np.linalg.norm(
+            np.array(bf.state[:2]) - np.array(self.agent.state[:2])) + 0.001) for i, bf in
+                         enumerate(self.belief_targets)])
         detcov = [LA.det(b_target.cov) for b_target in self.belief_targets]
         r_detcov_mean = - np.mean(np.log(detcov))
         r_detcov_std = - np.std(np.log(detcov))
-        c_mean = 0.1
-        c_std = 0.0
-        c_penalty = 1.0
-        reward = c_mean * r_detcov_mean + c_std * r_detcov_std
+        c_penalty = 0.0 if self.MAP.map is None else 10.0
         if "is_col" in kwargs.keys() and kwargs["is_col"]:
-            reward = min(0.0, reward) - c_penalty * 1.0
+            reward = - 1.0 * c_penalty
         return reward, False, r_detcov_mean, r_detcov_std
+        # detcov = [LA.det(b_target.cov) for b_target in self.belief_targets]
+        # r_detcov_mean = - np.mean(np.log(detcov))
+        # r_detcov_std = - np.std(np.log(detcov))
+        # c_mean = 0.1
+        # c_std = 0.0
+        # c_penalty = 1.0
+        # reward = c_mean * r_detcov_mean + c_std * r_detcov_std
+        # if "is_col" in kwargs.keys() and kwargs["is_col"]:
+        #     reward = min(0.0, reward) - c_penalty * 1.0
+        # return reward, False, r_detcov_mean, r_detcov_std
         # shaped reward
         # c_penalty = 1
         # detcov = [LA.det(b_target.cov) for b_target in self.belief_targets]
@@ -625,6 +638,17 @@ class TargetTrackingEnv1_1(TargetTrackingBase):
         self.build_models(const_q=METADATA['const_q'], known_noise=known_noise)
         self.discover_cnt = [0 for _ in range(self.num_targets)]
 
+
+    def _generate_predictive_gmm(self):
+        predictive_gmms = []
+        for target_belief in self.belief_targets:
+            predictive_zs = target_belief.generate_predictive_samples()
+            state_dim = len(predictive_zs[0])
+            gmm_cov = [np.eye(state_dim) * GMM_APPROX_VAR for _ in target_belief.weights]
+            predictive_gmm = GMMDist(target_belief.weights, predictive_zs, gmm_cov)
+            predictive_gmms.append(predictive_gmm)
+        return predictive_gmms
+
     def reset(self, **kwargs):
         # Always set the limits first.
         if 'target_speed_limit' in kwargs:
@@ -643,12 +667,12 @@ class TargetTrackingEnv1_1(TargetTrackingBase):
         for i in range(self.num_targets):
             self.belief_targets[i].reset(self.prior_dists[i])
             self.targets[i].reset(np.concatenate((init_pose['targets'][i][:2], self.target_init_vel)))
-
+        self.observation_hist = []
         # The targets are observed by the agent (z_0) and the beliefs are updated (b_0).
         observed = self.observe_and_update_belief()
         self.last_est_dists = [np.linalg.norm(np.array(bf.state[:2]) - np.array(self.agent.state[:2])) for bf in
                                self.belief_targets]
-        self.last_ents = [bf.entropy() for bf in self.belief_targets]
+        self.last_ents = [gmm.sg_entropy_ub() for gmm in self._generate_predictive_gmm()]
         self.agent_target_dist = [[] for _ in range(self.num_targets)]
         self.max_ent = np.log(np.prod(np.array(self.limit["target"][1]) - np.array(self.limit["target"][0])))
         # Compute the RL state.
@@ -673,7 +697,7 @@ class TargetTrackingEnv1_1(TargetTrackingBase):
 
         self.last_est_dists = [np.linalg.norm(np.array(bf.state[:2]) - np.array(self.agent.state[:2])) for bf in
                                self.belief_targets]
-        self.last_ents = [bf.entropy() for bf in self.belief_targets]
+        self.last_ents = [gmm.sg_entropy_ub() for gmm in self._generate_predictive_gmm()]
         for i in range(self.num_targets):
             self.agent_target_dist[i].append(
                 np.linalg.norm(np.array(self.targets[i].state[:2]) - np.array(self.agent.state[:2])))
@@ -742,14 +766,17 @@ class TargetTrackingEnv1_1(TargetTrackingBase):
 
     def observe_and_update_belief(self):
         observed = []
+        observation_vals = []
         for i in range(self.num_targets):
             observation = self.observation(self.targets[i])
             observed.append(observation[0])
+            observation_vals.append(observation[1])
             if observation[0]:  # if observed, update the target belief.
                 self.belief_targets[i].update(observation, self.agent.state)
                 self.discover_cnt[i] += 1
                 if not (self.has_discovered[i]):
                     self.has_discovered[i] = 1
+        self.observation_hist.append(observation_vals)
         return observed
 
     def set_limits(self, target_speed_limit=None):
@@ -862,26 +889,48 @@ class TargetTrackingEnv1_1(TargetTrackingBase):
         #     for _ in range(self.num_targets)]
 
     def get_reward(self, is_training=True, **kwargs):
-        reward = np.sum([1 / (np.linalg.norm(
-            np.array(bf.state[:2]) - np.array(self.agent.state[:2])) + 0.001) for i, bf in
-                         enumerate(self.belief_targets)])
-        c_penalty = 1.0
-        if "is_col" in kwargs.keys() and kwargs["is_col"]:
-            reward = reward - 1.0 * c_penalty
-        return reward, False, 0, 0
-
-
-        # reward = np.sum([self.last_ents[i] - bf.entropy() for i, bf in
+        # reward = np.sum([1 / (np.linalg.norm(
+        #     np.array(bf.state[:2]) - np.array(self.agent.state[:2])) + 0.001) for i, bf in
         #                  enumerate(self.belief_targets)])
         # detcov = [LA.det(b_target.cov) for b_target in self.belief_targets]
         # r_detcov_mean = - np.mean(np.log(detcov))
         # r_detcov_std = - np.std(np.log(detcov))
-        # c_penalty = 1.0
+        # c_penalty =  0.0 if self.MAP.map is None else 1.0
         # if "is_col" in kwargs.keys() and kwargs["is_col"]:
         #     reward = reward - 1.0 * c_penalty
         # return reward, False, r_detcov_mean, r_detcov_std
 
 
+        reward = np.sum([(self.last_ents[i] - bf.entropy())/ (np.linalg.norm(
+             np.array(bf.state[:2]) - np.array(self.agent.state[:2])) + 0.001) for i, bf in
+                         enumerate(self.belief_targets)])
+        detcov = [LA.det(b_target.cov) for b_target in self.belief_targets]
+        r_detcov_mean = - np.mean(np.log(detcov))
+        r_detcov_std = - np.std(np.log(detcov))
+        c_penalty = 0.0 if self.MAP.map is None else 10.0
+        if "is_col" in kwargs.keys() and kwargs["is_col"]:
+            reward = - 1.0 * c_penalty
+        return reward, False, r_detcov_mean, r_detcov_std
+
+        # reward = np.sum([(self.last_ents[i] - bf.entropy()) for i, bf in
+        #                  enumerate(self.belief_targets)])
+        # detcov = [LA.det(b_target.cov) for b_target in self.belief_targets]
+        # r_detcov_mean = - np.mean(np.log(detcov))
+        # r_detcov_std = - np.std(np.log(detcov))
+        # c_penalty = 0.0 if self.MAP.map is None else 1.0
+        # if "is_col" in kwargs.keys() and kwargs["is_col"]:
+        #     reward = reward - 1.0 * c_penalty
+        # return reward, False, r_detcov_mean, r_detcov_std
+
+
+        # reward = np.sum(self.observation_hist[-1])
+        # detcov = [LA.det(b_target.cov) for b_target in self.belief_targets]
+        # r_detcov_mean = - np.mean(np.log(detcov))
+        # r_detcov_std = - np.std(np.log(detcov))
+        # c_penalty = 0.0 if self.MAP.map is None else 1.0
+        # if "is_col" in kwargs.keys() and kwargs["is_col"]:
+        #     reward = reward - 1.0 * c_penalty
+        # return reward, False, r_detcov_mean, r_detcov_std
 
 
 class TargetTrackingEnv2(TargetTrackingEnv0):
